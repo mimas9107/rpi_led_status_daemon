@@ -1,6 +1,10 @@
-# Raspberry Pi LED 狀態指示與按鈕控制守護進程
+# Raspberry Pi LED 狀態指示與按鈕控制 Daemon
 
-這是一個為 Raspberry Pi 設計的高效 LED 狀態指示系統，使用 C++ 編寫的常駐程式，透過 libgpiod 控制硬體。系統包含 LED 閃爍狀態指示和按鈕控制功能，可透過按鈕執行關機與重開機操作。
+本專案為 Raspberry Pi 設計的 LED 狀態指示系統，使用 C++ 編寫，透過 libgpiod 控制硬體。支援 LED 閃爍狀態指示與按鈕控制關機/重開機功能。
+
+## 版本
+
+**Current: 1.0.0**
 
 ## 功能特性
 
@@ -17,9 +21,58 @@
 ### 系統特點
 - 低資源消耗的 C++ 常駐程式
 - 使用現代化的 libgpiod GPIO 介面
-- 完整的訊號處理（SIGTERM、SIGINT、SIGHUP）
+- 支援命令列參數與環境變數配置 GPIO
+- 完整的訊號處理（SIGTERM、SIGINT）
 - 系統日誌記錄（syslog）
-- 守護進程模式運行
+- 與 systemd Type=simple 相容
+
+## 命令列用法
+
+### 參數選項
+
+| 短參數 | 長參數 | 說明 | 預設值 |
+|--------|--------|------|--------|
+| `-l` | `--led-gpio` | LED GPIO 編號 (BCM) | 17 |
+| `-s` | `--shutdown-btn` | 關機按鈕 GPIO 編號 | 18 |
+| `-r` | `--reboot-btn` | 重開機按鈕 GPIO 編號 | 26 |
+| `-S` | `--shutdown-hold` | 關機按鈕長按時間 (ms) | 10000 |
+| `-R` | `--reboot-hold` | 重開機按鈕長按時間 (ms) | 3000 |
+| `-c` | `--chip` | GPIO chip 名稱 | gpiochip0 |
+| `-h` | `--help` | 顯示說明 |
+
+### 使用範例
+
+```bash
+# 使用預設值（GPIO 17/18/26）
+led_status_daemon_button
+
+# 自訂 GPIO 編號
+led_status_daemon_button -l 21 -s 20 -r 16
+
+# 自訂按鈕長按時間
+led_status_daemon_button -S 5000 -R 2000
+```
+
+### 使用環境變數（推薦用於 systemd）
+
+```ini
+[Service]
+ExecStart=/usr/local/bin/led_status_daemon_button
+Environment="LED_GPIO=17"
+Environment="BUTTON_SHUTDOWN=18"
+Environment="BUTTON_REBOOT=26"
+Environment="SHUTDOWN_HOLD_MS=10000"
+Environment="REBOOT_HOLD_MS=3000"
+Type=simple
+Restart=on-failure
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**優先順序**：命令列參數 > 環境變數 > 預設值
 
 ## 硬體需求
 
@@ -97,9 +150,9 @@ g++ led_status_daemon.cpp -o output/led_status_daemon -lgpiod -lstdc++fs -Wall -
 
 ## 系統服務設定
 
-### 建立 Systemd 服務檔案
+### 建立 Systemd 服務檔案（推薦 Type=simple）
 
-建立 `/etc/systemd/system/led_status_daemon.service`：
+建立 `/etc/systemd/system/led_status_button_shutdown.service`：
 
 ```ini
 [Unit]
@@ -108,14 +161,10 @@ After=network.target
 
 [Service]
 ExecStart=/usr/local/bin/led_status_daemon_button
-ExecStop=/bin/kill -TERM $MAINPID
-Type=forking
+Type=simple
 Restart=on-failure
+RestartSec=5
 User=root
-Group=root
-StandardOutput=syslog
-StandardError=syslog
-SyslogIdentifier=led_status_daemon
 
 [Install]
 WantedBy=multi-user.target
@@ -128,13 +177,13 @@ WantedBy=multi-user.target
 sudo systemctl daemon-reload
 
 # 啟用開機自動啟動
-sudo systemctl enable led_status_daemon.service
+sudo systemctl enable led_status_button_shutdown.service
 
 # 啟動服務
-sudo systemctl start led_status_daemon.service
+sudo systemctl start led_status_button_shutdown.service
 
 # 查看服務狀態
-sudo systemctl status led_status_daemon.service
+sudo systemctl status led_status_button_shutdown.service
 ```
 
 ## 測試與驗證
@@ -143,10 +192,10 @@ sudo systemctl status led_status_daemon.service
 
 ```bash
 # 查看即時日誌
-journalctl -u led_status_daemon.service -f
+journalctl -u led_status_button_shutdown -f
 
 # 查看最近 50 行日誌
-journalctl -u led_status_daemon.service -n 50
+journalctl -u led_status_button_shutdown -n 50
 ```
 
 ### 測試 LED 功能
@@ -183,8 +232,8 @@ journalctl -u led_status_daemon.service -n 50
 ### 程式流程
 
 1. **初始化階段**
+   - 解析命令列參數與環境變數
    - 設定訊號處理器（SIGTERM、SIGINT）
-   - 轉換為守護進程（daemonize）
    - 開啟 syslog 日誌系統
    - 初始化 GPIO 晶片與線路
 
@@ -206,8 +255,8 @@ journalctl -u led_status_daemon.service -n 50
 **A:** 檢查以下項目：
 - 確認 GPIO 17 連接正確
 - 確認 LED 極性（長腳接正極）
-- 查看服務日誌：`journalctl -u led_status_daemon.service -n 50`
-- 確認服務狀態：`sudo systemctl status led_status_daemon.service`
+- 查看服務日誌：`journalctl -u led_status_button_shutdown -n 50`
+- 確認服務狀態：`sudo systemctl status led_status_button_shutdown.service`
 
 ### Q: 按鈕沒有作用
 **A:** 檢查以下項目：
@@ -217,32 +266,35 @@ journalctl -u led_status_daemon.service -n 50
 - 確認按鈕按住時間達到要求（10 秒或 3 秒）
 
 ### Q: 如何調整閃爍頻率？
-**A:** 編輯原始碼中的常數：
-```cpp
-// 修改這些數值（單位：毫秒）
-const std::chrono::milliseconds RUNNING_BLINK_ON_MS(1000);
-const std::chrono::milliseconds RUNNING_BLINK_OFF_MS(1000);
+**A:** 使用命令列參數或環境變數：
+```bash
+# 使用環境變數（推薦）
+Environment="LED_BLINK_ON_MS=500"
+Environment="LED_BLINK_OFF_MS=500"
+
+# 或使用命令列（不推薦，難以在 service 中使用）
+led_status_daemon_button --led-gpio 17 --shutdown-btn 18 --reboot-btn 26
 ```
-修改後需重新編譯並重新啟動服務。
 
 ### Q: 如何調整按鈕長按時間？
-**A:** 編輯原始碼中的常數：
-```cpp
-// 關機按鈕長按時間（10 秒）
-const std::chrono::milliseconds BUTTON_PRESS_DURATION_MS(10000);
+**A:** 使用命令列參數或環境變數：
+```bash
+# 使用環境變數（推薦）
+Environment="SHUTDOWN_HOLD_MS=5000"
+Environment="REBOOT_HOLD_MS=2000"
 
-// 重開機按鈕長按時間（3 秒）
-const std::chrono::milliseconds REBOOT_PRESS_DURATION_MS(3000);
+# 或使用命令列
+led_status_daemon_button -S 5000 -R 2000
 ```
 
 ### Q: 如何停止服務？
 **A:** 執行以下指令：
 ```bash
 # 停止服務
-sudo systemctl stop led_status_daemon.service
+sudo systemctl stop led_status_button_shutdown.service
 
 # 禁用開機自動啟動
-sudo systemctl disable led_status_daemon.service
+sudo systemctl disable led_status_button_shutdown.service
 ```
 
 ## 授權與貢獻

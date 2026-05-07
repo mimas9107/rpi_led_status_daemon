@@ -1,60 +1,97 @@
 #include <iostream>
-#include <gpiod.h>      // libgpiod 庫
-#include <unistd.h>     // for sleep functions (usleep)
-#include <signal.h>     // for signal handling (SIGTERM, SIGINT)
-#include <syslog.h>     // for logging to syslog
-#include <thread>       // for std::this_thread::sleep_for
-#include <chrono>       // for std::chrono::milliseconds
-#include <sys/stat.h>   // for umask()
-#include <string>       // for std::string
-#include <cstdlib>      // for system()
+#include <gpiod.h>
+#include <unistd.h>
+#include <signal.h>
+#include <syslog.h>
+#include <thread>
+#include <chrono>
+#include <sys/stat.h>
+#include <string>
+#include <cstdlib>
+#include <getopt.h>
 
-// --- 配置參數 ---
-// GPIO Chip Name (通常 Raspberry Pi 4 是 gpiocip0)
-const char *GPIO_CHIP_NAME = "gpiochip0";
+// ============================================================
+// 1. 預設配置（当没有 CLI args 或环境变数时使用）
+// ============================================================
 
-// LED GPIO Line (BCM 編號為 17)
-const unsigned int LED_GPIO_LINE = 17;
+const char *DEFAULT_GPIO_CHIP = "gpiochip0";
+const unsigned int DEFAULT_LED_GPIO = 17;
+const unsigned int DEFAULT_BUTTON_SHUTDOWN = 18;
+const unsigned int DEFAULT_BUTTON_REBOOT = 26;
 
-// 按鈕 GPIO Line (BCM 編號為 18，請根據你的連接調整)
-const unsigned int BUTTON_GPIO_LINE = 18;
-const unsigned int BUTTON_GPIO_REBOOT = 26;
+// 按钮长按触发时间（毫秒）
+const int DEFAULT_SHUTDOWN_HOLD_MS = 10000;
+const int DEFAULT_REBOOT_HOLD_MS = 3000;
 
-// 按鈕按下觸發關機所需的持續時間 (單位: 毫秒)
-const std::chrono::milliseconds BUTTON_PRESS_DURATION_MS(10000); // shutdown 按 10秒
+// LED 闪烁时间（毫秒）
+const int DEFAULT_LED_BLINK_ON_MS = 1000;
+const int DEFAULT_LED_BLINK_OFF_MS = 1000;
 
-const std::chrono::milliseconds REBOOT_PRESS_DURATION_MS(3000); // reboot 按 3秒
+// 关机/重启闪烁
+const int DEFAULT_SHUTDOWN_BLINK_ON_MS = 100;
+const int DEFAULT_SHUTDOWN_BLINK_OFF_MS = 100;
+const int DEFAULT_SHUTDOWN_BLINK_COUNT = 10;
+const int DEFAULT_REBOOT_BLINK_COUNT = 3;
 
-// 運行中閃爍頻率 (單位: 毫秒)
-const std::chrono::milliseconds RUNNING_BLINK_ON_MS(1000);
-const std::chrono::milliseconds RUNNING_BLINK_OFF_MS(1000);
+// 防抖动延迟
+const int DEFAULT_DEBOUNCE_MS = 80;
 
-// 關機閃爍頻率 (單位: 毫秒)
-const std::chrono::milliseconds SHUTDOWN_BLINK_ON_MS(100);
-const std::chrono::milliseconds SHUTDOWN_BLINK_OFF_MS(100);
+// ============================================================
+// 2. 执行期配置（由 config_parser 填充）
+// ============================================================
 
-const int SHUTDOWN_BLINK_COUNT = 10;
-const int RESET_BLINK_COUNT = 3;
+struct gpio_config {
+    const char *chip_name;
+    unsigned int led_gpio;
+    unsigned int button_shutdown_gpio;
+    unsigned int button_reboot_gpio;
+    int shutdown_hold_ms;
+    int reboot_hold_ms;
+    int led_blink_on_ms;
+    int led_blink_off_ms;
+    int shutdown_blink_on_ms;
+    int shutdown_blink_off_ms;
+    int shutdown_blink_count;
+    int reboot_blink_count;
+    int debounce_ms;
+};
 
-// 按鈕防抖動延遲 (單位: 毫秒)
-const std::chrono::milliseconds DEBOUNCE_DELAY_MS(80);
+gpio_config g_config = {
+    DEFAULT_GPIO_CHIP,
+    DEFAULT_LED_GPIO,
+    DEFAULT_BUTTON_SHUTDOWN,
+    DEFAULT_BUTTON_REBOOT,
+    DEFAULT_SHUTDOWN_HOLD_MS,
+    DEFAULT_REBOOT_HOLD_MS,
+    DEFAULT_LED_BLINK_ON_MS,
+    DEFAULT_LED_BLINK_OFF_MS,
+    DEFAULT_SHUTDOWN_BLINK_ON_MS,
+    DEFAULT_SHUTDOWN_BLINK_OFF_MS,
+    DEFAULT_SHUTDOWN_BLINK_COUNT,
+    DEFAULT_REBOOT_BLINK_COUNT,
+    DEFAULT_DEBOUNCE_MS
+};
 
-// 主循環每次迭代的延遲 (單位: 毫秒)
-const std::chrono::milliseconds MAIN_LOOP_DELAY_MS(50);
+// ============================================================
+// 3. 全域变数
+// ============================================================
 
-// --- 全域變數 ---
 struct gpiod_chip *chip = nullptr;
 struct gpiod_line *led_line = nullptr;
 struct gpiod_line *button_line = nullptr;
-
 struct gpiod_line *button_reboot = nullptr;
 
-volatile sig_atomic_t running = 1; // 控制主循環運行
+volatile sig_atomic_t running = 1;
+volatile bool shutdown_initiated = false;
+volatile bool reboot_initiated = false;
 
-volatile bool shutdown_initiated = false; // 標記是否已觸發關機
-volatile bool reboot_initiated = false; // 觸發重置
+// ============================================================
+// 4. 函式宣告
+// ============================================================
 
-// --- 函式宣告 ---
+void print_usage(const char *prog_name);
+void parse_config(int argc, char *argv[]);
+int init_gpio();
 void cleanup_gpio();
 void signal_handler(int signum);
 void shutdown_sequence();
@@ -63,183 +100,112 @@ void daemonize();
 void execute_shutdown();
 void execute_reboot();
 
-int main() {
-    // 1. 設定訊號處理器
+int main(int argc, char *argv[]) {
+    // 1. 解析命令列引数与环境变数
+    parse_config(argc, argv);
+
+    // 2. 设定信号处理器（先于 daemonize，确保能捕获信号）
     signal(SIGTERM, signal_handler);
     signal(SIGINT, signal_handler);
 
-    // 2. 轉換為守護進程 (Daemon)
-    daemonize();
+    // 3. 如果需要守护进程模式则调用，否则直接运行
+    // 注意：Type=simple 时不需要 daemonize()
+    // daemonize();  // <-- 在 Type=simple 下不需要，注释掉
 
-    // 初始化 syslog，用於記錄日誌
+    // 4. 初始化 syslog
     openlog("led_status_daemon", LOG_PID|LOG_CONS, LOG_DAEMON);
     syslog(LOG_INFO, "LED status daemon starting with button support.");
+    syslog(LOG_INFO, "Config: LED=%d, ShutdownBtn=%d, RebootBtn=%d",
+          g_config.led_gpio, g_config.button_shutdown_gpio, g_config.button_reboot_gpio);
 
-    // 3. 初始化 GPIO
-    chip = gpiod_chip_open_by_name(GPIO_CHIP_NAME);
-    if (!chip) {
-        syslog(LOG_ERR, "Failed to open GPIO chip: %s", GPIO_CHIP_NAME);
-        closelog();
-        return 1;
-    }
-
-    // 初始化 LED GPIO
-    led_line = gpiod_chip_get_line(chip, LED_GPIO_LINE);
-    if (!led_line) {
-        syslog(LOG_ERR, "Failed to get LED GPIO line: %d", LED_GPIO_LINE);
-        gpiod_chip_close(chip);
-        closelog();
-        return 1;
-    }
-    int ret = gpiod_line_request_output(led_line, "led_status_daemon_led", 0);
-    if (ret < 0) {
-        syslog(LOG_ERR, "Failed to request LED GPIO line as output.");
-        gpiod_line_release(led_line);
-        gpiod_chip_close(chip);
-        closelog();
-        return 1;
-    }
-    syslog(LOG_INFO, "LED GPIO %d initialized successfully.", LED_GPIO_LINE);
-
-    // 初始化按鈕 GPIO
-    button_line = gpiod_chip_get_line(chip, BUTTON_GPIO_LINE);
-    if (!button_line) {
-        syslog(LOG_ERR, "Failed to get Button GPIO line: %d", BUTTON_GPIO_LINE);
-        // 如果按鈕初始化失敗，仍然嘗試運行 LED 部分
-        gpiod_line_release(led_line); // 釋放已請求的 LED line
-        gpiod_chip_close(chip);
-        closelog();
-        return 1;
-    }
-    // 請求 GPIO 線為輸入模式，並啟用內部上拉電阻
-    // "led_status_daemon_button" 作為消費者名稱
-    ret = gpiod_line_request_input_flags(button_line, "led_status_daemon_button", GPIOD_LINE_REQUEST_FLAG_BIAS_PULL_UP);
-    if (ret < 0) {
-        syslog(LOG_ERR, "Failed to request Button GPIO line as input with pull-up.");
-        gpiod_line_release(button_line); // 釋放已請求的 button line
-        gpiod_line_release(led_line);   // 釋放已請求的 LED line
-        gpiod_chip_close(chip);
-        closelog();
-        return 1;
-    }
-    // 初始化 reboot按鈕 GPIO
-    button_reboot = gpiod_chip_get_line(chip, BUTTON_GPIO_REBOOT);
-    if(!button_reboot){
-        syslog(LOG_ERR, "Failed to get Button Reset line: %d", BUTTON_GPIO_REBOOT);
-        gpiod_line_release(led_line);
-        gpiod_chip_close(chip);
-        closelog();
-        return 1;
-    }
-    ret = gpiod_line_request_input_flags(button_reboot, "led_status_daemon_button", GPIOD_LINE_REQUEST_FLAG_BIAS_PULL_UP);
-    if (ret<0){
-        syslog(LOG_ERR, "Failed to request Button GPIO for reboot as input with pull-up.");
-        gpiod_line_release(button_reboot);
-        gpiod_line_release(led_line);
-        gpiod_chip_close(chip);
-        closelog();
+    // 5. 初始化 GPIO
+    if (init_gpio() != 0) {
         return 1;
     }
 
-    syslog(LOG_INFO, "Button GPIO %d initialized successfully with pull-up.", BUTTON_GPIO_LINE);
-    syslog(LOG_INFO, "Button GPIO %d initialized successfully with pull-up.", BUTTON_GPIO_REBOOT);
-
-    // 4. 主循環：監控按鈕和閃爍 LED
-    auto button_press_start_time = std::chrono::steady_clock::now();
-    auto reboot_press_start_time = std::chrono::steady_clock::now();
-
-    bool button_was_pressed = false;
-    
-    bool reboot_was_pressed = false;
+    // 6. 主循环：监控按钮和闪烁 LED
+    auto shutdown_press_start = std::chrono::steady_clock::now();
+    auto reboot_press_start = std::chrono::steady_clock::now();
+    bool shutdown_button_pressed = false;
+    bool reboot_button_pressed = false;
+    bool led_state = false;
 
     while (running) {
-        // LED 閃爍邏輯 (每輪迴閃爍一次，或只是保持 LED 狀態)
-        static bool led_state = false; // 記錄 LED 當前狀態
-        if (led_state) {
-            gpiod_line_set_value(led_line, 0); // 滅
-            led_state = false;
-        } else {
-            gpiod_line_set_value(led_line, 1); // 亮
-            led_state = true;
-        }
+        // LED 闪烁
+        led_state = !led_state;
+        gpiod_line_set_value(led_line, led_state ? 1 : 0);
 
-        // 讀取按鈕狀態 (通常按鈕接到 GND，所以按下時是 LOW 電平)
-        int button_value = gpiod_line_get_value(button_line);
+        // 读取按钮状态（ LOW = 按下）
+        int shutdown_val = gpiod_line_get_value(button_line);
+        int reboot_val = g_config.button_reboot_gpio > 0 ? gpiod_line_get_value(button_reboot) : 1;
 
-        int reboot_value = gpiod_line_get_value(button_reboot);
-
-        if (button_value == 0) { // 按鈕被按下 (LOW 電平)
-            if (!button_was_pressed) {
-                // 第一次檢測到按下
-                button_press_start_time = std::chrono::steady_clock::now();
-                button_was_pressed = true;
-                syslog(LOG_INFO, "Button %d pressed.", BUTTON_GPIO_LINE);
+        // 处理关机按钮
+        if (shutdown_val == 0) {
+            if (!shutdown_button_pressed) {
+                shutdown_press_start = std::chrono::steady_clock::now();
+                shutdown_button_pressed = true;
+                syslog(LOG_INFO, "Shutdown button pressed.");
             } else {
-                // 按鈕持續按下
-                auto now = std::chrono::steady_clock::now();
-                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - button_press_start_time);
-
-                if (elapsed >= BUTTON_PRESS_DURATION_MS && !shutdown_initiated) {
-                    syslog(LOG_WARNING, "Button %d held for %lld ms. Initiating shutdown!",
-                           BUTTON_GPIO_LINE, elapsed.count());
-                    shutdown_initiated = true; // 設置關機標記
-                    running = 0; // 停止主循環，觸發關機序列
+                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - shutdown_press_start);
+                if (elapsed.count() >= g_config.shutdown_hold_ms && !shutdown_initiated) {
+                    syslog(LOG_WARNING, "Shutdown button held %ld ms. Initiating shutdown!",
+                          elapsed.count());
+                    shutdown_initiated = true;
+                    running = 0;
                 }
             }
-        } else { // 按鈕沒有按下 (HIGH 電平)
-            if (button_was_pressed) {
-                // 按鈕鬆開了
-                button_was_pressed = false;
-                syslog(LOG_INFO, "Button %d released.", BUTTON_GPIO_LINE);
+        } else {
+            if (shutdown_button_pressed) {
+                shutdown_button_pressed = false;
+                syslog(LOG_INFO, "Shutdown button released.");
             }
         }
-        
-        // reboot being pressed. 
-        if (reboot_value == 0){
-            if(!reboot_was_pressed){
-                reboot_press_start_time = std::chrono::steady_clock::now();
-                reboot_was_pressed = true;
-                syslog(LOG_INFO, "Reset %d pressed.", BUTTON_GPIO_REBOOT);
-            } else{
-                auto now = std::chrono::steady_clock::now();
-                auto elapsed_reboot = std::chrono::duration_cast<std::chrono::milliseconds>(now - reboot_press_start_time);
-                if(elapsed_reboot >= REBOOT_PRESS_DURATION_MS && !reboot_initiated){
-                    syslog(LOG_WARNING, "Button %d held for %lld ms. Initiating reboot!", BUTTON_GPIO_REBOOT, elapsed_reboot.count());
+
+        // 处理重启按钮
+        if (g_config.button_reboot_gpio > 0 && reboot_val == 0) {
+            if (!reboot_button_pressed) {
+                reboot_press_start = std::chrono::steady_clock::now();
+                reboot_button_pressed = true;
+                syslog(LOG_INFO, "Reboot button pressed.");
+            } else {
+                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - reboot_press_start);
+                if (elapsed.count() >= g_config.reboot_hold_ms && !reboot_initiated) {
+                    syslog(LOG_WARNING, "Reboot button held %ld ms. Initiating reboot!",
+                          elapsed.count());
                     reboot_initiated = true;
                     running = 0;
                 }
             }
-        } else{
-            if(reboot_was_pressed){
-                reboot_was_pressed = false;
-                syslog(LOG_INFO, "Button $d released.", BUTTON_GPIO_REBOOT);
+        } else {
+            if (reboot_button_pressed) {
+                reboot_button_pressed = false;
+                syslog(LOG_INFO, "Reboot button released.");
             }
         }
-        // reboot logic
 
-        // 主循環延遲，控制 LED 閃爍速度和按鈕檢測頻率
-        // 確保總的閃爍週期符合預期
-        std::this_thread::sleep_for(RUNNING_BLINK_ON_MS + RUNNING_BLINK_OFF_MS); // 或者直接使用 MAIN_LOOP_DELAY_MS
-        // 在這裡使用 MAIN_LOOP_DELAY_MS 更合適，它會頻繁檢查按鈕，並控制 LED 的間隔
-        // std::this_thread::sleep_for(MAIN_LOOP_DELAY_MS);
+        // 延迟
+        std::this_thread::sleep_for(std::chrono::milliseconds(
+            g_config.led_blink_on_ms + g_config.led_blink_off_ms));
     }
 
-    // 5. 執行關機序列 (如果不是從按鈕觸發的，這裡也會執行)
-    syslog(LOG_INFO, "Received stop signal or shutdown initiated. Performing shutdown sequence.");
-    shutdown_sequence();
-    
-    // 6. 如果是通過按鈕觸發的關機，則執行系統關機命令
-    // shutdown command:
+    // 7. 执行关机或重启序列
     if (shutdown_initiated) {
+        syslog(LOG_INFO, "Initiating shutdown sequence.");
+        shutdown_sequence();
         execute_shutdown();
-    }
-    // reboot command:
-    if(reboot_initiated){
+    } else if (reboot_initiated) {
+        syslog(LOG_INFO, "Initiating reboot sequence.");
         reboot_sequence();
         execute_reboot();
+    } else {
+        // 收到 SIGTERM，正常關閉
+        syslog(LOG_INFO, "Performing graceful shutdown sequence.");
+        shutdown_sequence();
     }
 
-    // 7. 清理 GPIO 資源
+    // 9. 清理 GPIO 资源
     cleanup_gpio();
     syslog(LOG_INFO, "LED status daemon stopped.");
     closelog();
@@ -247,91 +213,204 @@ int main() {
     return 0;
 }
 
-// 清理 GPIO 資源
+// ============================================================
+// 5. config_parser：解析 CLI args + 环境变数 + 预设值
+// ============================================================
+
+void print_usage(const char *prog_name) {
+    std::printf("用法: %s [选项]\n", prog_name);
+    std::printf("  -l, --led-gpio <num>       LED GPIO 编号 (默认: %d)\n", DEFAULT_LED_GPIO);
+    std::printf("  -s, --shutdown-btn <num>     关机按钮 GPIO 编号 (默认: %d)\n", DEFAULT_BUTTON_SHUTDOWN);
+    std::printf("  -r, --reboot-btn <num>    重启按钮 GPIO 编号 (默认: %d)\n", DEFAULT_BUTTON_REBOOT);
+    std::printf("  -S, --shutdown-hold <ms> 关机按钮长按时间 (默认: %d ms)\n", DEFAULT_SHUTDOWN_HOLD_MS);
+    std::printf("  -R, --reboot-hold <ms>    重启按钮长按时间 (默认: %d ms)\n", DEFAULT_REBOOT_HOLD_MS);
+    std::printf("  -c, --chip <name>         GPIO chip 名称 (默认: %s)\n", DEFAULT_GPIO_CHIP);
+    std::printf("  -h, --help                显示此帮助信息\n");
+}
+
+void parse_config(int argc, char *argv[]) {
+    static struct option long_options[] = {
+        {"led-gpio", required_argument, 0, 'l'},
+        {"shutdown-btn", required_argument, 0, 's'},
+        {"reboot-btn", required_argument, 0, 'r'},
+        {"shutdown-hold", required_argument, 0, 'S'},
+        {"reboot-hold", required_argument, 0, 'R'},
+        {"chip", required_argument, 0, 'c'},
+        {"help", no_argument, 0, 'h'},
+        {0, 0, 0, 0}
+    };
+
+    int opt;
+    int option_index = 0;
+
+    while ((opt = getopt_long(argc, argv, "l:s:r:S:R:c:h", long_options, &option_index)) != -1) {
+        switch (opt) {
+            case 'l': g_config.led_gpio = std::stoi(optarg); break;
+            case 's': g_config.button_shutdown_gpio = std::stoi(optarg); break;
+            case 'r': g_config.button_reboot_gpio = std::stoi(optarg); break;
+            case 'S': g_config.shutdown_hold_ms = std::stoi(optarg); break;
+            case 'R': g_config.reboot_hold_ms = std::stoi(optarg); break;
+            case 'c': g_config.chip_name = optarg; break;
+            case 'h': print_usage(argv[0]); exit(0);
+            default: print_usage(argv[0]); exit(1);
+        }
+    }
+
+    // 环境变量优先于预设值（CLI 参数已在前面覆盖环境变量）
+    const char *env;
+    if ((env = std::getenv("LED_GPIO")) != nullptr) g_config.led_gpio = std::stoi(env);
+    if ((env = std::getenv("BUTTON_SHUTDOWN")) != nullptr) g_config.button_shutdown_gpio = std::stoi(env);
+    if ((env = std::getenv("BUTTON_REBOOT")) != nullptr) g_config.button_reboot_gpio = std::stoi(env);
+    if ((env = std::getenv("SHUTDOWN_HOLD_MS")) != nullptr) g_config.shutdown_hold_ms = std::stoi(env);
+    if ((env = std::getenv("REBOOT_HOLD_MS")) != nullptr) g_config.reboot_hold_ms = std::stoi(env);
+    if ((env = std::getenv("GPIO_CHIP")) != nullptr) g_config.chip_name = env;
+}
+
+// ============================================================
+// 6. init_gpio：GPIO 初始化
+// ============================================================
+
+int init_gpio() {
+    chip = gpiod_chip_open_by_name(g_config.chip_name);
+    if (!chip) {
+        syslog(LOG_ERR, "Failed to open GPIO chip: %s", g_config.chip_name);
+        closelog();
+        return -1;
+    }
+
+    // LED GPIO
+    led_line = gpiod_chip_get_line(chip, g_config.led_gpio);
+    if (!led_line) {
+        syslog(LOG_ERR, "Failed to get LED GPIO line: %d", g_config.led_gpio);
+        gpiod_chip_close(chip);
+        closelog();
+        return -1;
+    }
+    if (gpiod_line_request_output(led_line, "led_status_daemon_led", 0) < 0) {
+        syslog(LOG_ERR, "Failed to request LED GPIO line as output.");
+        gpiod_line_release(led_line);
+        gpiod_chip_close(chip);
+        closelog();
+        return -1;
+    }
+    syslog(LOG_INFO, "LED GPIO %d initialized.", g_config.led_gpio);
+
+    // 关机按钮 GPIO
+    button_line = gpiod_chip_get_line(chip, g_config.button_shutdown_gpio);
+    if (!button_line) {
+        syslog(LOG_ERR, "Failed to get shutdown button GPIO: %d", g_config.button_shutdown_gpio);
+        gpiod_line_release(led_line);
+        gpiod_chip_close(chip);
+        closelog();
+        return -1;
+    }
+    if (gpiod_line_request_input_flags(button_line, "led_status_daemon_button",
+                                        GPIOD_LINE_REQUEST_FLAG_BIAS_PULL_UP) < 0) {
+        syslog(LOG_ERR, "Failed to request shutdown button as input.");
+        gpiod_line_release(button_line);
+        gpiod_line_release(led_line);
+        gpiod_chip_close(chip);
+        closelog();
+        return -1;
+    }
+    syslog(LOG_INFO, "Shutdown button GPIO %d initialized.", g_config.button_shutdown_gpio);
+
+    // 重启按钮 GPIO（可选）
+    if (g_config.button_reboot_gpio > 0) {
+        button_reboot = gpiod_chip_get_line(chip, g_config.button_reboot_gpio);
+        if (!button_reboot) {
+            syslog(LOG_ERR, "Failed to get reboot button GPIO: %d", g_config.button_reboot_gpio);
+            gpiod_line_release(button_line);
+            gpiod_line_release(led_line);
+            gpiod_chip_close(chip);
+            closelog();
+            return -1;
+        }
+        if (gpiod_line_request_input_flags(button_reboot, "led_status_daemon_reboot",
+                                        GPIOD_LINE_REQUEST_FLAG_BIAS_PULL_UP) < 0) {
+            syslog(LOG_ERR, "Failed to request reboot button as input.");
+            gpiod_line_release(button_reboot);
+            gpiod_line_release(button_line);
+            gpiod_line_release(led_line);
+            gpiod_chip_close(chip);
+            closelog();
+            return -1;
+        }
+        syslog(LOG_INFO, "Reboot button GPIO %d initialized.", g_config.button_reboot_gpio);
+    }
+
+    return 0;
+}
+
+// ============================================================
+// 7-12. 保留函数（稍作整理）
+// ============================================================
+
 void cleanup_gpio() {
     if (led_line) {
-        gpiod_line_set_value(led_line, 0); // 確保 LED 熄滅
-        gpiod_line_release(led_line); // 釋放 GPIO 線
+        gpiod_line_set_value(led_line, 0);
+        gpiod_line_release(led_line);
     }
     if (button_line) {
-        gpiod_line_release(button_line); // 釋放 GPIO 線
+        gpiod_line_release(button_line);
+    }
+    if (button_reboot) {
+        gpiod_line_release(button_reboot);
     }
     if (chip) {
-        gpiod_chip_close(chip); // 關閉 GPIO chip
+        gpiod_chip_close(chip);
     }
 }
 
-// 訊號處理器
 void signal_handler(int signum) {
     syslog(LOG_INFO, "Received signal %d. Setting running flag to false.", signum);
-    running = 0; // 設置 running 旗標為 0，通知主循環停止
+    running = 0;
 }
 
-// 關機序列：快速閃爍 3 次後熄滅
 void shutdown_sequence() {
-    for (int i = 0; i < SHUTDOWN_BLINK_COUNT; ++i) {
-        gpiod_line_set_value(led_line, 1); // LED 亮
-        std::this_thread::sleep_for(SHUTDOWN_BLINK_ON_MS);
-        gpiod_line_set_value(led_line, 0); // LED 滅
-        std::this_thread::sleep_for(SHUTDOWN_BLINK_OFF_MS);
+    for (int i = 0; i < g_config.shutdown_blink_count; ++i) {
+        gpiod_line_set_value(led_line, 1);
+        std::this_thread::sleep_for(std::chrono::milliseconds(g_config.shutdown_blink_on_ms));
+        gpiod_line_set_value(led_line, 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(g_config.shutdown_blink_off_ms));
     }
-    gpiod_line_set_value(led_line, 0); // 確保 LED 最終熄滅
+    gpiod_line_set_value(led_line, 0);
 }
 
-void reboot_sequence(){
-   for(int i=0; i< 3; ++i){
-      gpiod_line_set_value(led_line, 1);
-      std::this_thread::sleep_for(SHUTDOWN_BLINK_ON_MS);
-      gpiod_line_set_value(led_line, 0);
-      std::this_thread::sleep_for(SHUTDOWN_BLINK_OFF_MS);
-   }
-   gpiod_line_set_value(led_line, 0);
+void reboot_sequence() {
+    for (int i = 0; i < g_config.reboot_blink_count; ++i) {
+        gpiod_line_set_value(led_line, 1);
+        std::this_thread::sleep_for(std::chrono::milliseconds(g_config.shutdown_blink_on_ms));
+        gpiod_line_set_value(led_line, 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(g_config.shutdown_blink_off_ms));
+    }
+    gpiod_line_set_value(led_line, 0);
 }
 
-// 執行系統關機命令
 void execute_shutdown() {
-    syslog(LOG_WARNING, "Executing system shutdown command: 'sudo shutdown -h now'");
-    // 使用 system() 執行 shell 命令，需要 root 權限
-    // 這裡使用 "sudo" 是為了確保命令能被執行，即使 daemon user 不是 root
-    // 但因為 service unit 中設定 User=root，所以直接 "shutdown -h now" 也可以
+    syslog(LOG_WARNING, "Executing system shutdown: 'sudo shutdown -h now'");
     system("sudo shutdown -h now");
 }
 
-// 執行重開機命令
-void execute_reboot(){
-    syslog(LOG_WARNING, "Executing system reboot command: 'sudo reboot'");
-
+void execute_reboot() {
+    syslog(LOG_WARNING, "Executing system reboot: 'sudo reboot'");
     system("sudo reboot");
 }
 
-// 將程式轉換為守護進程 (與之前相同)
 void daemonize() {
     pid_t pid = fork();
+    if (pid < 0) exit(EXIT_FAILURE);
+    if (pid > 0) exit(EXIT_SUCCESS);
 
-    if (pid < 0) {
-        exit(EXIT_FAILURE);
-    }
-    if (pid > 0) {
-        exit(EXIT_SUCCESS);
-    }
-
-    if (setsid() < 0) {
-        exit(EXIT_FAILURE);
-    }
-
+    if (setsid() < 0) exit(EXIT_FAILURE);
     signal(SIGHUP, SIG_IGN);
 
     pid = fork();
-    if (pid < 0) {
-        exit(EXIT_FAILURE);
-    }
-    if (pid > 0) {
-        exit(EXIT_SUCCESS);
-    }
+    if (pid < 0) exit(EXIT_FAILURE);
+    if (pid > 0) exit(EXIT_SUCCESS);
 
     umask(0);
     chdir("/");
-
     close(STDIN_FILENO);
     close(STDOUT_FILENO);
     close(STDERR_FILENO);
