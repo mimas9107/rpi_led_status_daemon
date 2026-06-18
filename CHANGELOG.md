@@ -1,3 +1,12 @@
+---
+name:          "CHANGELOG.md"
+description:   "Project change history"
+created_date:  "2026/06/18 10:00:00"
+modified_date: "2026/06/18 10:00:00"
+project_version: "1.0.0"
+document_version: "1.0.0"
+agent_sign: ['gemini cli/current_agent']
+---
 # CHANGELOG - LED Status Daemon
 
 All notable changes to this project will be documented in this file.

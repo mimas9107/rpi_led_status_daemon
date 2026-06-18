@@ -1,3 +1,12 @@
+---
+name:          "README.md"
+description:   "Raspberry Pi LED status and button control daemon documentation"
+created_date:  "2026/06/18 10:00:00"
+modified_date: "2026/06/18 10:00:00"
+project_version: "1.0.0"
+document_version: "1.0.0"
+agent_sign: ['gemini cli/current_agent']
+---
 # Raspberry Pi LED 狀態指示與按鈕控制 Daemon
 
 本專案為 Raspberry Pi 設計的 LED 狀態指示系統，使用 C++ 編寫，透過 libgpiod 控制硬體。支援 LED 閃爍狀態指示與按鈕控制關機/重開機功能。
